@@ -1,0 +1,29 @@
+import type { NextFunction, Request, Response } from 'express';
+import { ZodError } from 'zod';
+
+export class HttpError extends Error {
+  constructor(public status: number, public code: string, message?: string) {
+    super(message ?? code);
+  }
+}
+
+// Wrap async route handlers so thrown errors reach the error middleware
+export const wrap =
+  (fn: (req: Request, res: Response, next: NextFunction) => Promise<unknown>) =>
+  (req: Request, res: Response, next: NextFunction) =>
+    fn(req, res, next).catch(next);
+
+export function errorHandler(err: unknown, _req: Request, res: Response, _next: NextFunction) {
+  if (err instanceof HttpError) {
+    return res.status(err.status).json({ error: err.code });
+  }
+  if (err instanceof ZodError) {
+    return res.status(400).json({ error: 'validation_error', details: err.flatten().fieldErrors });
+  }
+  // SQLite unique-index violation => someone else took the slot
+  if (String((err as any)?.message ?? '').includes('UNIQUE constraint failed: appointments.')) {
+    return res.status(409).json({ error: 'slot_taken' });
+  }
+  console.error(err);
+  res.status(500).json({ error: 'server_error' });
+}

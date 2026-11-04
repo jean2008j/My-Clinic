@@ -1,0 +1,38 @@
+{
+  "name": "clinic-server",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "db:migrate": "tsx src/migrate.ts",
+    "db:seed": "tsx src/seed.ts",
+    "user:password": "tsx src/setPassword.ts",
+    "db:reset": "tsx src/migrate.ts --reset && tsx src/seed.ts",
+    "test:api": "node scripts/smoke-test.mjs"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.5",
+    "express": "^4.19.2",
+    "jsonwebtoken": "^9.0.2",
+    "luxon": "^3.5.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/bcryptjs": "^2.4.6",
+    "@types/cors": "^2.8.17",
+    "@types/express": "^4.17.21",
+    "@types/jsonwebtoken": "^9.0.6",
+    "@types/luxon": "^3.4.2",
+    "@types/node": "^24.0.0",
+    "tsx": "^4.16.0",
+    "typescript": "^5.5.3"
+  },
+  "engines": {
+    "node": ">=22.13.0"
+  }
+}
