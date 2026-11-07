@@ -31,14 +31,14 @@ const patientFields = {
 const id = z.coerce.number().int().positive();
 const tokenRe = /^[0-9a-f]{32}$/;
 
-interface ProviderRow { id: number; name_ar: string; name_en: string; active: number }
-interface ServiceRow { id: number; duration_min: number; active: number }
+interface ProviderRow { id: number; name_ar: string; name_en: string; active: boolean }
+interface ServiceRow { id: number; duration_min: number; active: boolean }
 
 /** Provider + service must exist, be active, and the provider must offer the service. */
-function resolve(providerId: number, serviceId: number) {
-  const provider = one<ProviderRow>('SELECT id, name_ar, name_en, active FROM providers WHERE id = ?', [providerId]);
-  const service = one<ServiceRow>('SELECT id, duration_min, active FROM services WHERE id = ?', [serviceId]);
-  const link = one('SELECT 1 AS x FROM provider_services WHERE provider_id = ? AND service_id = ?', [providerId, serviceId]);
+async function resolve(providerId: number, serviceId: number) {
+  const provider = await one<ProviderRow>('SELECT id, name_ar, name_en, active FROM providers WHERE id = ?', [providerId]);
+  const service = await one<ServiceRow>('SELECT id, duration_min, active FROM services WHERE id = ?', [serviceId]);
+  const link = await one('SELECT 1 AS x FROM provider_services WHERE provider_id = ? AND service_id = ?', [providerId, serviceId]);
   if (!provider?.active || !service?.active || !link) throw new HttpError(404, 'not_found');
   return { provider, service };
 }
@@ -50,21 +50,21 @@ const SELECT_APPT = `
     JOIN providers p ON p.id = a.provider_id
     JOIN services  s ON s.id = a.service_id`;
 
-const byToken = (token: string) => {
+const byToken = async (token: string) => {
   if (!tokenRe.test(token)) throw new HttpError(404, 'not_found');
-  const row = one<any>(`${SELECT_APPT} WHERE a.manage_token = ?`, [token]);
+  const row = await one<any>(`${SELECT_APPT} WHERE a.manage_token = ?`, [token]);
   if (!row) throw new HttpError(404, 'not_found');
   return row;
 };
 
-const byId = (rowId: number) => one<any>(`${SELECT_APPT} WHERE a.id = ?`, [rowId])!;
+const byId = async (rowId: number) => (await one<any>(`${SELECT_APPT} WHERE a.id = ?`, [rowId]))!;
 
 const canModify = (row: { status: string; start_at: string }) =>
   row.status === 'confirmed' &&
   DateTime.fromISO(row.start_at).toMillis() > DateTime.now().plus({ hours: config.booking.changeCutoffHours }).toMillis();
 
-function toDto(row: any) {
-  const review = one<{ rating: number; comment: string | null }>(
+async function toDto(row: any) {
+  const review = await one<{ rating: number; comment: string | null }>(
     'SELECT rating, comment FROM reviews WHERE appointment_id = ?', [row.id],
   );
   return {
@@ -84,80 +84,84 @@ function toDto(row: any) {
 }
 
 /** Parse a slot start (UTC ISO) and confirm it is a real free slot. Returns its UTC ISO. */
-function assertSlotFree(providerId: number, durationMin: number, start: string, excludeId = 0) {
+async function assertSlotFree(providerId: number, durationMin: number, start: string, excludeId = 0) {
   const dt = DateTime.fromISO(start, { zone: config.tz });
   if (!dt.isValid) throw new HttpError(400, 'invalid_start');
   const startIso = toUtcIso(dt);
-  const slots = getSlots(providerId, durationMin, dt.toISODate()!, excludeId);
+  const slots = await getSlots(providerId, durationMin, dt.toISODate()!, excludeId);
   if (!slots.some((s) => s.start === startIso)) throw new HttpError(409, 'slot_unavailable');
   return dt;
 }
 
 // ---------- catalogue ----------
 
-publicRouter.get('/services', (_req, res) => {
-  const rows = all(
+publicRouter.get('/services', wrap(async (_req, res) => {
+  const rows = await all(
     `SELECT id, name_ar, name_en, description_ar, description_en, duration_min
-       FROM services WHERE active = 1 ORDER BY id`,
+       FROM services WHERE active ORDER BY id`,
   );
   res.json({ services: rows });
-});
+}));
 
-publicRouter.get('/providers', (req, res) => {
+publicRouter.get('/providers', wrap(async (req, res) => {
   const { serviceId } = z.object({ serviceId: id.optional() }).parse(req.query);
-  const providers = all<any>(
+  const rows = await all<any>(
     `SELECT id, name_ar, name_en, specialty_ar, specialty_en, bio_ar, bio_en
-       FROM providers WHERE active = 1 ORDER BY id`,
-  )
-    .map((p) => ({
-      ...p,
-      serviceIds: all<{ service_id: number }>(
-        'SELECT service_id FROM provider_services WHERE provider_id = ?', [p.id],
-      ).map((r) => r.service_id),
-      ...ratingOf(p.id),
-    }))
+       FROM providers WHERE active ORDER BY id`,
+  );
+  const links = await all<{ provider_id: number; service_id: number }>(
+    'SELECT provider_id, service_id FROM provider_services',
+  );
+  // Average of the reviews the clinic approved (what visitors see).
+  const ratings = await all<{ provider_id: number; avg: number; n: number }>(
+    'SELECT provider_id, avg(rating) AS avg, count(*) AS n FROM reviews WHERE approved GROUP BY provider_id',
+  );
+  const providers = rows
+    .map((p) => {
+      const r = ratings.find((x) => x.provider_id === p.id);
+      return {
+        ...p,
+        serviceIds: links.filter((l) => l.provider_id === p.id).map((l) => l.service_id),
+        ratingAvg: r ? Math.round(r.avg * 10) / 10 : null,
+        ratingCount: r ? r.n : 0,
+      };
+    })
     .filter((p) => !serviceId || p.serviceIds.includes(serviceId));
   res.json({ providers });
-});
+}));
 
-// Average of the reviews the clinic approved (what visitors see).
-function ratingOf(providerId: number) {
-  const r = one<{ avg: number | null; n: number }>(
-    'SELECT avg(rating) AS avg, count(*) AS n FROM reviews WHERE provider_id = ? AND approved = 1', [providerId],
-  )!;
-  return { ratingAvg: r.avg === null ? null : Math.round(r.avg * 10) / 10, ratingCount: r.n };
-}
-
-publicRouter.get('/holidays', (_req, res) => {
-  const rows = all(
+publicRouter.get('/holidays', wrap(async (_req, res) => {
+  const rows = await all(
     `SELECT id, provider_id, day, reason_ar, reason_en FROM holidays WHERE day >= ? ORDER BY day`,
     [todayLocal()],
   );
   res.json({ holidays: rows });
-});
+}));
 
 // ---------- availability ----------
 
 // Free slots of one day
 // Optional `token` = the patient's own booking: its current time is then shown as free (so it can be kept / moved around).
-const excludeIdOf = (token?: string) =>
-  token ? one<{ id: number }>('SELECT id FROM appointments WHERE manage_token = ?', [token])?.id ?? 0 : 0;
+const excludeIdOf = async (token?: string) =>
+  token ? (await one<{ id: number }>('SELECT id FROM appointments WHERE manage_token = ?', [token]))?.id ?? 0 : 0;
 const tokenParam = z.string().regex(tokenRe).optional();
 
-publicRouter.get('/slots', (req, res) => {
+publicRouter.get('/slots', wrap(async (req, res) => {
   const q = z.object({ providerId: id, serviceId: id, date: z.string(), token: tokenParam }).parse(req.query);
   if (!isDate(q.date)) throw new HttpError(400, 'invalid_date');
-  const { service } = resolve(q.providerId, q.serviceId);
-  res.json({ date: q.date, durationMin: service.duration_min, slots: getSlots(q.providerId, service.duration_min, q.date, excludeIdOf(q.token)) });
-});
+  const { service } = await resolve(q.providerId, q.serviceId);
+  const slots = await getSlots(q.providerId, service.duration_min, q.date, await excludeIdOf(q.token));
+  res.json({ date: q.date, durationMin: service.duration_min, slots });
+}));
 
 // Calendar of a month: free slot count per day (0 = full / closed), holiday flag
-publicRouter.get('/availability', (req, res) => {
+publicRouter.get('/availability', wrap(async (req, res) => {
   const q = z.object({ providerId: id, serviceId: id, month: z.string(), token: tokenParam }).parse(req.query);
   if (!isMonth(q.month)) throw new HttpError(400, 'invalid_month');
-  const { service } = resolve(q.providerId, q.serviceId);
-  res.json({ month: q.month, days: monthAvailability(q.providerId, service.duration_min, q.month, excludeIdOf(q.token)) });
-});
+  const { service } = await resolve(q.providerId, q.serviceId);
+  const days = await monthAvailability(q.providerId, service.duration_min, q.month, await excludeIdOf(q.token));
+  res.json({ month: q.month, days });
+}));
 
 // ---------- booking ----------
 
@@ -178,36 +182,36 @@ publicRouter.post(
   wrap(async (req, res) => {
     const b = createSchema.parse(req.body);
 
-    const created = transaction(() => {
-      // Everything below runs inside BEGIN IMMEDIATE, so two people can't grab the same slot.
-      const { service } = resolve(b.providerId, b.serviceId);
-      const dt = assertSlotFree(b.providerId, service.duration_min, b.start);
+    const created = await transaction(async () => {
+      // Everything below runs in one locked transaction, so two people can't grab the same slot.
+      const { service } = await resolve(b.providerId, b.serviceId);
+      const dt = await assertSlotFree(b.providerId, service.duration_min, b.start);
 
-      const upcoming = one<{ n: number }>(
+      const upcoming = (await one<{ n: number }>(
         `SELECT count(*) AS n FROM appointments WHERE phone = ? AND status = 'confirmed' AND start_at > ?`,
         [b.phone, nowIso()],
-      )!.n;
+      ))!.n;
       if (upcoming >= config.booking.maxUpcomingPerPhone) throw new HttpError(409, 'too_many_bookings');
 
-      const r = run(
+      const r = await run(
         `INSERT INTO appointments (provider_id, service_id, patient_name, phone, email, notes, start_at, end_at, lang)
-         VALUES (?,?,?,?,?,?,?,?,?)`,
+         VALUES (?,?,?,?,?,?,?,?,?) RETURNING id`,
         [
           b.providerId, b.serviceId, b.patientName, b.phone, b.email || null, b.notes || null,
           toUtcIso(dt), toUtcIso(dt.plus({ minutes: service.duration_min })), b.lang,
         ],
       );
-      return byId(Number(r.lastInsertRowid));
+      return byId(r.id!);
     });
 
-    res.status(201).json({ appointment: toDto(created) });
+    res.status(201).json({ appointment: await toDto(created) });
   }),
 );
 
 // Patient views his booking with the secret link token
-publicRouter.get('/appointments/:token', manageLimit, (req, res) => {
-  res.json({ appointment: toDto(byToken(req.params.token)) });
-});
+publicRouter.get('/appointments/:token', manageLimit, wrap(async (req, res) => {
+  res.json({ appointment: await toDto(await byToken(req.params.token)) });
+}));
 
 // Edit contact details and/or move to another time (same doctor, same service)
 const patchSchema = z
@@ -221,17 +225,17 @@ publicRouter.patch(
   wrap(async (req, res) => {
     const b = patchSchema.parse(req.body);
 
-    const updated = transaction(() => {
-      const row = byToken(req.params.token);
+    const updated = await transaction(async () => {
+      const row = await byToken(req.params.token);
       if (!canModify(row)) throw new HttpError(403, 'cannot_modify');
 
       let { start_at, end_at } = row;
       if (b.start) {
-        const dt = assertSlotFree(row.provider_id, row.duration_min, b.start, row.id);
+        const dt = await assertSlotFree(row.provider_id, row.duration_min, b.start, row.id);
         start_at = toUtcIso(dt);
         end_at = toUtcIso(dt.plus({ minutes: row.duration_min }));
       }
-      run(
+      await run(
         `UPDATE appointments
             SET patient_name = ?, phone = ?, email = ?, notes = ?, start_at = ?, end_at = ?, updated_at = ?
           WHERE id = ?`,
@@ -246,7 +250,7 @@ publicRouter.patch(
       return byId(row.id);
     });
 
-    res.json({ appointment: toDto(updated) });
+    res.json({ appointment: await toDto(updated) });
   }),
 );
 
@@ -254,11 +258,11 @@ publicRouter.post(
   '/appointments/:token/cancel',
   manageLimit,
   wrap(async (req, res) => {
-    const row = byToken(req.params.token);
+    const row = await byToken(req.params.token);
     if (row.status === 'cancelled') throw new HttpError(409, 'already_cancelled');
     if (!canModify(row)) throw new HttpError(403, 'cannot_modify');
-    run(`UPDATE appointments SET status = 'cancelled', updated_at = ? WHERE id = ?`, [nowIso(), row.id]);
-    res.json({ appointment: toDto(byId(row.id)) });
+    await run(`UPDATE appointments SET status = 'cancelled', updated_at = ? WHERE id = ?`, [nowIso(), row.id]);
+    res.json({ appointment: await toDto(await byId(row.id)) });
   }),
 );
 
@@ -275,26 +279,26 @@ publicRouter.post(
   manageLimit,
   wrap(async (req, res) => {
     const b = reviewSchema.parse(req.body);
-    const row = byToken(req.params.token);
+    const row = await byToken(req.params.token);
     if (row.status !== 'completed') throw new HttpError(403, 'cannot_review');
-    if (one('SELECT 1 AS x FROM reviews WHERE appointment_id = ?', [row.id])) throw new HttpError(409, 'already_reviewed');
-    run('INSERT INTO reviews (appointment_id, provider_id, rating, comment) VALUES (?,?,?,?)', [
+    if (await one('SELECT 1 AS x FROM reviews WHERE appointment_id = ?', [row.id])) throw new HttpError(409, 'already_reviewed');
+    await run('INSERT INTO reviews (appointment_id, provider_id, rating, comment) VALUES (?,?,?,?)', [
       row.id, row.provider_id, b.rating, b.comment || null,
     ]);
-    res.status(201).json({ appointment: toDto(byId(row.id)) });
+    res.status(201).json({ appointment: await toDto(await byId(row.id)) });
   }),
 );
 
 // Approved reviews, newest first. Only the patient's first name is shown.
-publicRouter.get('/reviews', (req, res) => {
+publicRouter.get('/reviews', wrap(async (req, res) => {
   const q = z.object({ providerId: id.optional(), limit: z.coerce.number().int().min(1).max(50).default(12) }).parse(req.query);
-  const rows = all<any>(
+  const rows = await all<any>(
     `SELECT r.id, r.rating, r.comment, r.created_at, a.patient_name,
             p.id AS provider_id, p.name_ar AS provider_name_ar, p.name_en AS provider_name_en
        FROM reviews r
        JOIN appointments a ON a.id = r.appointment_id
        JOIN providers p ON p.id = r.provider_id
-      WHERE r.approved = 1 AND (? IS NULL OR r.provider_id = ?)
+      WHERE r.approved AND (?::int IS NULL OR r.provider_id = ?)
       ORDER BY r.created_at DESC
       LIMIT ?`,
     [q.providerId ?? null, q.providerId ?? null, q.limit],
@@ -306,4 +310,4 @@ publicRouter.get('/reviews', (req, res) => {
       provider: { id: r.provider_id, nameAr: r.provider_name_ar, nameEn: r.provider_name_en },
     })),
   });
-});
+}));

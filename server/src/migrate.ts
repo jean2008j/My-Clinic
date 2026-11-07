@@ -1,22 +1,26 @@
 import { readFileSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { dirname, join } from 'node:path';
-import { db } from './db.js';
+import { pool, closeDb } from './db.js';
 
 const here = dirname(fileURLToPath(import.meta.url));
 const schema = readFileSync(join(here, '..', 'db', 'schema.sql'), 'utf8');
 
-if (process.argv.includes('--reset')) {
-  console.log('Dropping existing tables...');
-  db.exec('PRAGMA foreign_keys = OFF');
-  for (const t of ['reviews', 'appointments', 'holidays', 'working_hours',
-                   'provider_services', 'services', 'providers', 'users']) {
-    db.exec(`DROP TABLE IF EXISTS ${t}`);
+const client = await pool.connect();
+try {
+  if (process.argv.includes('--reset')) {
+    console.log('Dropping the clinic schema (all clinic data is erased)...');
+    await client.query('DROP SCHEMA IF EXISTS clinic CASCADE');
   }
-  db.exec('PRAGMA foreign_keys = ON');
+  console.log('Applying schema...');
+  await client.query('BEGIN');
+  await client.query(schema);
+  await client.query('COMMIT');
+  console.log('Schema ready.');
+} catch (e) {
+  await client.query('ROLLBACK').catch(() => {});
+  throw e;
+} finally {
+  client.release();
+  await closeDb();
 }
-
-console.log('Applying schema...');
-db.exec(schema);
-console.log('Schema ready.');
-db.close();

@@ -2,7 +2,10 @@ import 'dotenv/config';
 
 export const config = {
   port: Number(process.env.PORT ?? 4000),
-  databaseFile: process.env.DATABASE_FILE ?? './data/clinic.db',
+  // Supabase: Project Settings -> Database -> Connection string (session pooler or direct), URI format.
+  databaseUrl: process.env.DATABASE_URL ?? '',
+  databaseSsl: process.env.DATABASE_SSL !== 'false', // Supabase needs SSL; set false only for a local Postgres
+  databasePoolMax: Number(process.env.DATABASE_POOL_MAX ?? 5),
   jwtSecret: process.env.JWT_SECRET ?? 'dev-only-secret-change-me',
   clientOrigin: process.env.CLIENT_ORIGIN ?? 'http://localhost:5173',
   tz: process.env.CLINIC_TZ ?? 'Europe/Amsterdam',

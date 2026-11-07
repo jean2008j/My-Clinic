@@ -4,8 +4,8 @@ import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import cors from 'cors';
 import { config } from './config.js';
-import { db } from './db.js';
-import { errorHandler } from './middleware/error.js';
+import { one } from './db.js';
+import { errorHandler, wrap } from './middleware/error.js';
 import { authRouter } from './routes/auth.js';
 import { publicRouter } from './routes/public.js';
 import { adminRouter } from './routes/admin.js';
@@ -14,13 +14,16 @@ import { requireAuth } from './middleware/auth.js';
 
 const app = express();
 
+// Behind a host's proxy (Render, Railway, ...) req.ip must be the visitor's IP, or the rate limits would see one shared IP.
+if (config.isProd) app.set('trust proxy', 1);
+
 app.use(cors({ origin: config.clientOrigin }));
 app.use(express.json({ limit: '100kb' }));
 
-app.get('/api/health', (_req, res) => {
-  db.prepare('SELECT 1').get();
+app.get('/api/health', wrap(async (_req, res) => {
+  await one('SELECT 1 AS ok');
   res.json({ ok: true, tz: config.tz });
-});
+}));
 
 app.use('/api/auth', authRouter);
 

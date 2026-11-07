@@ -1,5 +1,5 @@
 import bcrypt from 'bcryptjs';
-import { db, one, transaction } from './db.js';
+import { closeDb, one, run, transaction } from './db.js';
 
 const adminEmail = process.env.SEED_ADMIN_EMAIL ?? 'admin@clinic.local';
 const adminPass = process.env.SEED_ADMIN_PASSWORD ?? 'Admin12345';
@@ -33,49 +33,58 @@ const services: [string, string, number][] = [
   ['زراعة سن (استشارة)', 'Implant Consultation', 30],
 ];
 
-const seed = () => transaction(() => {
-  db.prepare(`INSERT OR IGNORE INTO users (email,password_hash,role) VALUES (?,?, 'admin')`)
-    .run(adminEmail, hash(adminPass));
+async function seed() {
+  await transaction(async () => {
+    await run(`INSERT INTO users (email,password_hash,role) VALUES (?,?, 'admin') ON CONFLICT DO NOTHING`,
+      [adminEmail, hash(adminPass)]);
 
-  const providerIds: number[] = [];
-  for (const p of providers) {
-    db.prepare(`INSERT OR IGNORE INTO users (email,password_hash,role) VALUES (?,?, 'provider')`)
-      .run(p.email, hash(providerPass));
-    const u = one<{ id: number }>('SELECT id FROM users WHERE email=?', [p.email])!;
-    const existing = one<{ id: number }>('SELECT id FROM providers WHERE user_id=?', [u.id]);
-    if (existing) { providerIds.push(existing.id); continue; }
-    const r = db.prepare(
-      `INSERT INTO providers (user_id,name_ar,name_en,specialty_ar,specialty_en,bio_ar,bio_en)
-       VALUES (?,?,?,?,?,?,?)`,
-    ).run(u.id, p.ar, p.en, p.spAr, p.spEn, p.bioAr, p.bioEn);
-    providerIds.push(Number(r.lastInsertRowid));
-  }
+    const providerIds: number[] = [];
+    for (const p of providers) {
+      await run(`INSERT INTO users (email,password_hash,role) VALUES (?,?, 'provider') ON CONFLICT DO NOTHING`,
+        [p.email, hash(providerPass)]);
+      const u = (await one<{ id: number }>('SELECT id FROM users WHERE lower(email) = lower(?)', [p.email]))!;
+      const existing = await one<{ id: number }>('SELECT id FROM providers WHERE user_id = ?', [u.id]);
+      if (existing) { providerIds.push(existing.id); continue; }
+      const r = await run(
+        `INSERT INTO providers (user_id,name_ar,name_en,specialty_ar,specialty_en,bio_ar,bio_en)
+         VALUES (?,?,?,?,?,?,?) RETURNING id`,
+        [u.id, p.ar, p.en, p.spAr, p.spEn, p.bioAr, p.bioEn],
+      );
+      providerIds.push(r.id!);
+    }
 
-  const n = one<{ n: number }>('SELECT count(*) AS n FROM services')!.n;
-  if (n > 0) return;
+    const n = (await one<{ n: number }>('SELECT count(*) AS n FROM services'))!.n;
+    if (n > 0) return;
 
-  const sids = services.map(([ar, en, dur]) =>
-    Number(db.prepare('INSERT INTO services (name_ar,name_en,duration_min) VALUES (?,?,?)')
-      .run(ar, en, dur).lastInsertRowid));
+    const sids: number[] = [];
+    for (const [ar, en, dur] of services) {
+      const r = await run('INSERT INTO services (name_ar,name_en,duration_min) VALUES (?,?,?) RETURNING id', [ar, en, dur]);
+      sids.push(r.id!);
+    }
 
-  const link = db.prepare('INSERT OR IGNORE INTO provider_services VALUES (?,?)');
-  const map = new Map<number, number[]>([
-    [providerIds[0], sids.slice(0, 5)],
-    [providerIds[1], [sids[0], sids[2], sids[4], sids[5]]],
-  ]);
-  for (const [pid, list] of map) for (const sid of list) link.run(pid, sid);
+    const map = new Map<number, number[]>([
+      [providerIds[0], sids.slice(0, 5)],
+      [providerIds[1], [sids[0], sids[2], sids[4], sids[5]]],
+    ]);
+    for (const [pid, list] of map) {
+      for (const sid of list) {
+        await run('INSERT INTO provider_services (provider_id, service_id) VALUES (?,?) ON CONFLICT DO NOTHING', [pid, sid]);
+      }
+    }
 
-  // Mon-Fri 09:00-13:00 & 14:00-17:30; Dr. Omar also Saturday morning
-  const wh = db.prepare('INSERT INTO working_hours (provider_id,weekday,start_time,end_time) VALUES (?,?,?,?)');
-  for (const pid of providerIds) {
-    for (let d = 1; d <= 5; d++) { wh.run(pid, d, '09:00', '13:00'); wh.run(pid, d, '14:00', '17:30'); }
-  }
-  wh.run(providerIds[1], 6, '09:00', '13:00');
-});
+    // Mon-Fri 09:00-13:00 & 14:00-17:30; Dr. Omar also Saturday morning
+    const wh = (pid: number, d: number, s: string, e: string) =>
+      run('INSERT INTO working_hours (provider_id,weekday,start_time,end_time) VALUES (?,?,?,?)', [pid, d, s, e]);
+    for (const pid of providerIds) {
+      for (let d = 1; d <= 5; d++) { await wh(pid, d, '09:00', '13:00'); await wh(pid, d, '14:00', '17:30'); }
+    }
+    await wh(providerIds[1], 6, '09:00', '13:00');
+  });
+}
 
-seed();
+await seed();
 console.log('Seed complete.');
 console.log(`  Admin:    ${adminEmail} / ${adminPass}`);
 console.log(`  Provider: dr.sara@clinic.local / ${providerPass}`);
 console.log(`  Provider: dr.omar@clinic.local / ${providerPass}`);
-db.close();
+await closeDb();

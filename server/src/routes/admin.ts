@@ -13,14 +13,14 @@ const id = z.coerce.number().int().positive();
 
 // ----- holidays -----
 
-adminRouter.get('/holidays', (_req, res) => {
+adminRouter.get('/holidays', wrap(async (_req, res) => {
   res.json({
-    holidays: all(
+    holidays: await all(
       `SELECT id, provider_id, day, reason_ar, reason_en FROM holidays WHERE day >= ? ORDER BY day`,
       [todayLocal()],
     ),
   });
-});
+}));
 
 const holidaySchema = z.object({
   day: z.string(),
@@ -35,25 +35,25 @@ adminRouter.post(
     const b = holidaySchema.parse(req.body);
     if (!isDate(b.day) || b.day < todayLocal()) throw new HttpError(400, 'invalid_day');
     const providerId = b.providerId ?? null;
-    if (providerId && !one('SELECT 1 AS x FROM providers WHERE id = ?', [providerId])) {
+    if (providerId && !(await one('SELECT 1 AS x FROM providers WHERE id = ?', [providerId]))) {
       throw new HttpError(404, 'provider_not_found');
     }
-    if (one('SELECT 1 AS x FROM holidays WHERE day = ? AND COALESCE(provider_id,0) = ?', [b.day, providerId ?? 0])) {
+    if (await one('SELECT 1 AS x FROM holidays WHERE day = ? AND COALESCE(provider_id,0) = ?', [b.day, providerId ?? 0])) {
       throw new HttpError(409, 'holiday_exists');
     }
-    const r = run('INSERT INTO holidays (provider_id, day, reason_ar, reason_en) VALUES (?,?,?,?)', [
+    const r = await run('INSERT INTO holidays (provider_id, day, reason_ar, reason_en) VALUES (?,?,?,?) RETURNING id', [
       providerId, b.day, b.reasonAr, b.reasonEn,
     ]);
 
     // Existing bookings are NOT cancelled automatically; we tell the admin how many to deal with.
     const range = dayRangeUtc(b.day);
-    const affected = one<{ n: number }>(
+    const affected = (await one<{ n: number }>(
       `SELECT count(*) AS n FROM appointments
-        WHERE status = 'confirmed' AND start_at >= ? AND start_at < ? AND (? IS NULL OR provider_id = ?)`,
+        WHERE status = 'confirmed' AND start_at >= ? AND start_at < ? AND (?::int IS NULL OR provider_id = ?)`,
       [range.from, range.to, providerId, providerId],
-    )!.n;
+    ))!.n;
 
-    res.status(201).json({ holiday: { id: Number(r.lastInsertRowid), day: b.day, providerId }, affectedAppointments: affected });
+    res.status(201).json({ holiday: { id: r.id, day: b.day, providerId }, affectedAppointments: affected });
   }),
 );
 
@@ -61,15 +61,15 @@ adminRouter.delete(
   '/holidays/:id',
   wrap(async (req, res) => {
     const hid = id.parse(req.params.id);
-    const r = run('DELETE FROM holidays WHERE id = ?', [hid]);
-    if (Number(r.changes) === 0) throw new HttpError(404, 'not_found');
+    const r = await run('DELETE FROM holidays WHERE id = ?', [hid]);
+    if (r.changes === 0) throw new HttpError(404, 'not_found');
     res.json({ ok: true });
   }),
 );
 
 // ----- appointments (basic list; the full dashboard comes in batch 5) -----
 
-adminRouter.get('/appointments', (req, res) => {
+adminRouter.get('/appointments', wrap(async (req, res) => {
   const q = z
     .object({
       from: z.string().optional(),
@@ -83,7 +83,7 @@ adminRouter.get('/appointments', (req, res) => {
   const from = dayRangeUtc(q.from ?? todayLocal()).from;
   const to = q.to ? dayRangeUtc(q.to).to : '9999-12-31T00:00:00.000Z';
 
-  const rows = all(
+  const rows = await all(
     `SELECT a.id, a.status, a.start_at, a.end_at, a.patient_name, a.phone, a.email, a.notes, a.lang,
             a.provider_id, p.name_en AS provider_name_en, p.name_ar AS provider_name_ar,
             a.service_id, s.name_en AS service_name_en, s.name_ar AS service_name_ar, s.duration_min
@@ -91,13 +91,13 @@ adminRouter.get('/appointments', (req, res) => {
        JOIN providers p ON p.id = a.provider_id
        JOIN services  s ON s.id = a.service_id
       WHERE a.start_at >= ? AND a.start_at < ?
-        AND (? IS NULL OR a.provider_id = ?)
-        AND (? IS NULL OR a.status = ?)
+        AND (?::int IS NULL OR a.provider_id = ?)
+        AND (?::text IS NULL OR a.status = ?)
       ORDER BY a.start_at`,
     [from, to, q.providerId ?? null, q.providerId ?? null, q.status ?? null, q.status ?? null],
   );
   res.json({ appointments: rows });
-});
+}));
 
 // ----- change the status of one appointment (completed / no-show / cancelled / back to confirmed) -----
 
@@ -108,24 +108,24 @@ adminRouter.patch(
   wrap(async (req, res) => {
     const aid = id.parse(req.params.id);
     const { status } = z.object({ status: z.enum(STATUSES) }).parse(req.body);
-    const row = one<{ status: string }>('SELECT status FROM appointments WHERE id = ?', [aid]);
+    const row = await one<{ status: string }>('SELECT status FROM appointments WHERE id = ?', [aid]);
     if (!row) throw new HttpError(404, 'not_found');
     // A cancelled booking stays cancelled: its time may already have been given to someone else.
     if (row.status === 'cancelled' || row.status === status) throw new HttpError(409, 'invalid_status_change');
-    run('UPDATE appointments SET status = ?, updated_at = ? WHERE id = ?', [status, nowIso(), aid]);
+    await run('UPDATE appointments SET status = ?, updated_at = ? WHERE id = ?', [status, nowIso(), aid]);
     res.json({ appointment: { id: aid, status } });
   }),
 );
 
 // ----- statistics -----
 
-adminRouter.get('/stats', (req, res) => {
+adminRouter.get('/stats', wrap(async (req, res) => {
   const q = z.object({ from: z.string(), to: z.string(), providerId: id.optional() }).parse(req.query);
   if (!isDate(q.from) || !isDate(q.to) || q.to < q.from) throw new HttpError(400, 'invalid_date');
   const days = DateTime.fromISO(q.to).diff(DateTime.fromISO(q.from), 'days').days;
   if (days > 400) throw new HttpError(400, 'invalid_date');
 
-  const rows = all<{
+  const rows = await all<{
     status: string; start_at: string; provider_id: number; service_id: number;
     p_ar: string; p_en: string; s_ar: string; s_en: string;
   }>(
@@ -134,7 +134,7 @@ adminRouter.get('/stats', (req, res) => {
        FROM appointments a
        JOIN providers p ON p.id = a.provider_id
        JOIN services  s ON s.id = a.service_id
-      WHERE a.start_at >= ? AND a.start_at < ? AND (? IS NULL OR a.provider_id = ?)`,
+      WHERE a.start_at >= ? AND a.start_at < ? AND (?::int IS NULL OR a.provider_id = ?)`,
     [dayRangeUtc(q.from).from, dayRangeUtc(q.to).to, q.providerId ?? null, q.providerId ?? null],
   );
 
@@ -172,13 +172,13 @@ adminRouter.get('/stats', (req, res) => {
     byProvider: [...byProvider.values()].sort(desc),
     byDay: [...byDay.entries()].map(([date, count]) => ({ date, count })).sort((a, b) => a.date.localeCompare(b.date)),
   });
-});
+}));
 
 // ----- reviews: patients' reviews wait here until the admin approves them -----
 
-adminRouter.get('/reviews', (req, res) => {
+adminRouter.get('/reviews', wrap(async (req, res) => {
   const { status } = z.object({ status: z.enum(['pending', 'approved', 'all']).default('all') }).parse(req.query);
-  const rows = all<any>(
+  const rows = await all<any>(
     `SELECT r.id, r.rating, r.comment, r.approved, r.created_at, a.patient_name, a.start_at,
             p.name_ar AS provider_name_ar, p.name_en AS provider_name_en,
             s.name_ar AS service_name_ar, s.name_en AS service_name_en
@@ -186,28 +186,28 @@ adminRouter.get('/reviews', (req, res) => {
        JOIN appointments a ON a.id = r.appointment_id
        JOIN providers p ON p.id = r.provider_id
        JOIN services  s ON s.id = a.service_id
-      WHERE (? = 'all' OR (? = 'pending' AND r.approved = 0) OR (? = 'approved' AND r.approved = 1))
+      WHERE (?::text = 'all' OR (?::text = 'pending' AND NOT r.approved) OR (?::text = 'approved' AND r.approved))
       ORDER BY r.created_at DESC
       LIMIT 300`,
     [status, status, status],
   );
   res.json({
     reviews: rows.map((r) => ({
-      id: r.id, rating: r.rating, comment: r.comment, approved: !!r.approved, createdAt: r.created_at, startAt: r.start_at,
+      id: r.id, rating: r.rating, comment: r.comment, approved: r.approved, createdAt: r.created_at, startAt: r.start_at,
       patientName: r.patient_name,
       provider: { nameAr: r.provider_name_ar, nameEn: r.provider_name_en },
       service: { nameAr: r.service_name_ar, nameEn: r.service_name_en },
     })),
   });
-});
+}));
 
 adminRouter.patch(
   '/reviews/:id',
   wrap(async (req, res) => {
     const rid = id.parse(req.params.id);
     const { approved } = z.object({ approved: z.boolean() }).parse(req.body);
-    const r = run('UPDATE reviews SET approved = ? WHERE id = ?', [approved ? 1 : 0, rid]);
-    if (Number(r.changes) === 0) throw new HttpError(404, 'not_found');
+    const r = await run('UPDATE reviews SET approved = ? WHERE id = ?', [approved, rid]);
+    if (r.changes === 0) throw new HttpError(404, 'not_found');
     res.json({ review: { id: rid, approved } });
   }),
 );
@@ -215,8 +215,8 @@ adminRouter.patch(
 adminRouter.delete(
   '/reviews/:id',
   wrap(async (req, res) => {
-    const r = run('DELETE FROM reviews WHERE id = ?', [id.parse(req.params.id)]);
-    if (Number(r.changes) === 0) throw new HttpError(404, 'not_found');
+    const r = await run('DELETE FROM reviews WHERE id = ?', [id.parse(req.params.id)]);
+    if (r.changes === 0) throw new HttpError(404, 'not_found');
     res.json({ ok: true });
   }),
 );

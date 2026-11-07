@@ -20,8 +20,9 @@ export function errorHandler(err: unknown, _req: Request, res: Response, _next: 
   if (err instanceof ZodError) {
     return res.status(400).json({ error: 'validation_error', details: err.flatten().fieldErrors });
   }
-  // SQLite unique-index violation => someone else took the slot
-  if (String((err as any)?.message ?? '').includes('UNIQUE constraint failed: appointments.')) {
+  // Postgres: no_overlap exclusion (23P01) or unique violation on appointments => someone else took the slot
+  const e = err as { code?: string; constraint?: string; table?: string };
+  if (e?.code === '23P01' || (e?.code === '23505' && e.table === 'appointments')) {
     return res.status(409).json({ error: 'slot_taken' });
   }
   console.error(err);
