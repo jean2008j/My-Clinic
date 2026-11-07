@@ -1,0 +1,13 @@
+{
+  "$schema": "https://openapi.vercel.sh/vercel.json",
+  "buildCommand": "npm --prefix client ci --include=dev && npm --prefix client run build",
+  "installCommand": "echo \"nothing to install at the root\"",
+  "outputDirectory": "client/dist",
+  "functions": {
+    "api/index.js": { "maxDuration": 15 }
+  },
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api" },
+    { "source": "/(.*)", "destination": "/index.html" }
+  ]
+}

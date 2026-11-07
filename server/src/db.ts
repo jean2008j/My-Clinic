@@ -18,47 +18,29 @@ export const pool = new pg.Pool({
   connectionString: config.databaseUrl,
   max: config.databasePoolMax,
   ssl: config.databaseSsl ? { rejectUnauthorized: false } : undefined,
-  idleTimeoutMillis: 30_000,
+  idleTimeoutMillis: 10_000,
 });
 pool.on('error', (e) => console.error('Postgres pool error:', e.message));
 
 // Queries inside transaction() automatically use the transaction's connection.
 const txStore = new AsyncLocalStorage<pg.PoolClient>();
 
-// Every connection looks in "clinic" first. Done once per connection and awaited BEFORE its first query.
-// (Needs a session-mode connection: Supabase "Session pooler" or "Direct connection", not the transaction pooler on port 6543.)
-const ready = new WeakSet<pg.PoolClient>();
-async function acquire(): Promise<pg.PoolClient> {
-  const client = await pool.connect();
-  if (!ready.has(client)) {
-    try {
-      await client.query('SET search_path TO clinic, extensions, public');
-      ready.add(client);
-    } catch (e) {
-      client.release(e as Error); // drop the broken connection
-      throw e;
-    }
-  }
-  return client;
-}
+// The SQL in the routes uses bare table names. Here every table name that follows FROM / JOIN / INTO / UPDATE gets the
+// "clinic." prefix, so no per-connection `search_path` is needed. That makes it work through ANY Supabase connection
+// type, including the transaction pooler (port 6543) that serverless hosts such as Vercel need.
+const TABLES = 'users|providers|services|provider_services|working_hours|holidays|appointments|reviews';
+const QUALIFY = new RegExp(`\\b(FROM|JOIN|INTO|UPDATE)\\s+(${TABLES})\\b`, 'gi');
 
 // Keep the "?" placeholders the code was written with: they become $1, $2, ...
 const toPg = (sql: string) => {
   let i = 0;
-  return sql.replace(/\?/g, () => `$${++i}`);
+  return sql.replace(QUALIFY, '$1 clinic.$2').replace(/\?/g, () => `$${++i}`);
 };
 
 type Param = string | number | boolean | null;
 
-async function query(sql: string, params: Param[]) {
-  const inTx = txStore.getStore();
-  if (inTx) return inTx.query(toPg(sql), params);
-  const client = await acquire();
-  try {
-    return await client.query(toPg(sql), params);
-  } finally {
-    client.release();
-  }
+function query(sql: string, params: Param[]) {
+  return (txStore.getStore() ?? pool).query(toPg(sql), params);
 }
 
 export async function all<T = any>(sql: string, params: Param[] = []): Promise<T[]> {
@@ -84,7 +66,7 @@ const BOOKING_LOCK = 727001;
  * The database's no_overlap constraint is the final safety net.
  */
 export async function transaction<T>(fn: () => Promise<T>): Promise<T> {
-  const client = await acquire();
+  const client = await pool.connect();
   try {
     await client.query('BEGIN');
     await client.query('SELECT pg_advisory_xact_lock($1)', [BOOKING_LOCK]);

@@ -15,7 +15,7 @@ Arabic (RTL) + English (LTR). Free bookings, on-screen confirmation.
 All tables live in their own Postgres schema, **`clinic`**, so they never mix with anything else in the same Supabase project. Row Level Security is ON with no policies: the public Supabase API can't read these tables, only this server can (it connects directly with `DATABASE_URL`).
 
 1. Supabase dashboard → **Connect** → copy the **Session pooler** URI (works on IPv4 hosts such as Render). Put it in `server/.env` as `DATABASE_URL` with your database password.
-   Use *Session pooler* or *Direct connection* — **not** the *Transaction pooler* (port 6543).
+   *Session pooler* (port 5432) for Render / your own computer, *Transaction pooler* (port 6543) for Vercel. Both work.
 2. `npm run db:migrate` creates / updates the schema, `npm run db:seed` adds demo data.
 3. `npm run db:reset` **drops the whole `clinic` schema** (all bookings!) and rebuilds it.
 
@@ -164,3 +164,23 @@ and run `npm start` from the `server` folder → open http://localhost:4000 (the
 3. After the first deploy open `https://<your-service>.onrender.com/api/health` — it should answer `{"ok":true,...}`.
 4. Change the seed passwords (run locally with the production `DATABASE_URL`): `npm run user:password -- admin@clinic.local "a long new password"`.
 Render's free plan puts the service to sleep after ~15 minutes without traffic (the first visit then takes ~30 s). A paid instance stays awake.
+
+## Deploy (Vercel)
+One Vercel project serves everything: the website (`client/dist`, built by Vercel) and the API as a serverless function (`api/index.js`). `vercel.json` already wires them together (`/api/*` → the function, every other path → the website).
+1. Push the repo to GitHub, then on https://vercel.com → **Add New… → Project** → import the repo. Leave the framework as **Other** and **don't** change Root Directory; the build settings come from `vercel.json`.
+2. Before pressing Deploy, add these **Environment Variables**:
+   | Name | Value |
+   |---|---|
+   | `DATABASE_URL` | Supabase → Connect → **Transaction pooler** URI (port 6543), with your database password |
+   | `JWT_SECRET` | a long random text, e.g. run `node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"` |
+   | `CLINIC_TZ` | `Europe/Amsterdam` (or yours; keep it equal to `CLINIC_TZ` in `client/src/i18n/index.tsx`) |
+3. Deploy, then open `https://<your-project>.vercel.app/api/health` → `{"ok":true,...}`.
+
+**Important — `api/index.js` is generated.** It is the whole server bundled into one file. After ANY change in `server/src`, run
+```bash
+cd server
+npm run build:vercel
+```
+and commit the updated `api/index.js`; otherwise Vercel keeps running the old server code.
+
+Good to know on Vercel: the 10 bookings/hour/IP limit is counted per running function instance (it is a soft limit there, the per-phone cap of upcoming bookings is stored in the database and stays exact). Double-booking protection lives in the database and is not affected.

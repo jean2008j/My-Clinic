@@ -11,7 +11,8 @@
     "db:seed": "tsx src/seed.ts",
     "user:password": "tsx src/setPassword.ts",
     "db:reset": "tsx src/migrate.ts --reset && tsx src/seed.ts",
-    "test:api": "node scripts/smoke-test.mjs"
+    "test:api": "node scripts/smoke-test.mjs",
+    "build:vercel": "node scripts/build-vercel.mjs"
   },
   "dependencies": {
     "bcryptjs": "^2.4.3",
@@ -31,6 +32,7 @@
     "@types/luxon": "^3.4.2",
     "@types/node": "^24.0.0",
     "@types/pg": "^8.23.1",
+    "esbuild": "^0.28.2",
     "tsx": "^4.16.0",
     "typescript": "^5.5.3"
   },
